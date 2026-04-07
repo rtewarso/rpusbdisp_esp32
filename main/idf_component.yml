@@ -1,0 +1,6 @@
+dependencies:
+  idf: "^5.5"
+  espressif/esp_tinyusb:
+    version: "^2.0.0"
+  esp_lcd_ili9341: "^1.0"
+  atanisoft/esp_lcd_touch_xpt2046: "1.0.5"
