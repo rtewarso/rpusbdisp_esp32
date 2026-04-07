@@ -16,10 +16,6 @@ static const char *TAG = "display";
 static esp_lcd_panel_handle_t panel_handle = NULL;
 static uint16_t *framebuffer = NULL;
 
-static uint16_t *copyarea = NULL;
-
-
-
 // Apply pixel operation: combine src into dst
 static inline uint16_t apply_op(uint16_t dst, uint16_t src, uint8_t op)
 {
@@ -113,7 +109,6 @@ esp_err_t display_init(void)
     framebuffer = heap_caps_malloc(fb_size, MALLOC_CAP_SPIRAM);
 #else
     framebuffer = malloc(fb_size);
-    copyarea    = malloc(fb_size);
 #endif
     if (!framebuffer) {
         ESP_LOGE(TAG, "Failed to allocate framebuffer");
@@ -145,6 +140,8 @@ void display_rect(int16_t left, int16_t top, int16_t right, int16_t bottom,
                   uint16_t color, uint8_t operation)
 {
     if (!framebuffer) return;
+
+	//ESP_LOGI(TAG, "%s", __FUNCTION__);
 
     // Clamp coordinates
     if (left < 0)
@@ -194,10 +191,19 @@ void display_bitblt(int16_t x, int16_t y, int16_t w, int16_t h,
 
 void display_copyarea(int16_t sx, int16_t sy, int16_t dx, int16_t dy, int16_t w, int16_t h)
 {
-    if (!framebuffer) return;
+	ESP_LOGI(TAG, "%s(%d, %d, %d, %d, %d, %d)", __FUNCTION__, sx, sy, dx, dy, w, h);
+
+    if (!framebuffer)
+		return;
 
     // Use a temporary buffer to handle overlapping regions
-    uint16_t *temp = copyarea;
+
+	// TODO: This doesn't have enough memory to make a full screen copy
+    uint16_t *temp = malloc(w*h*sizeof(uint16_t));
+
+    if (!temp) {
+        return;
+    }
 
     if (w >= RPUSBDISP_WIDTH)
 		w = RPUSBDISP_WIDTH;
@@ -212,6 +218,9 @@ void display_copyarea(int16_t sx, int16_t sy, int16_t dx, int16_t dy, int16_t w,
 
         for (int col = 0; col < w; col++) {
             int src_x = sx + col;
+
+			//ESP_LOGI(TAG, "  <%d, %d, %d, %d, %d, %d>", src_x, src_y, row, col, w, h);
+
             if (src_x < 0 || src_x > RPUSBDISP_WIDTH) {
                 temp[row * w + col] = 0;
             } else {
@@ -234,6 +243,8 @@ void display_copyarea(int16_t sx, int16_t sy, int16_t dx, int16_t dy, int16_t w,
     }
 
     display_flush_region(dx, dy, w, h);
+
+    free(temp);
 }
 
 uint16_t *display_get_framebuffer(void)

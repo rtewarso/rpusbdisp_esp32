@@ -18,8 +18,9 @@ static void touch_poll_task(void *arg)
 {
     while (1) {
 
-        if (touch_handle) {
-//          if(0) {
+// TODO: Get this working
+//        if (touch_handle) {
+          if(0) {
             esp_lcd_touch_read_data(touch_handle);
 
             uint16_t x[1], y[1];
