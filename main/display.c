@@ -16,6 +16,23 @@ static const char *TAG = "display";
 static esp_lcd_panel_handle_t panel_handle = NULL;
 static uint16_t *framebuffer = NULL;
 
+// Reusable temp buffer for flush and copyarea to avoid repeated alloc/free
+static uint16_t *temp_buffer = NULL;
+static size_t temp_buffer_size = 0;
+
+static uint16_t *get_temp_buffer(size_t size)
+{
+    if (size <= temp_buffer_size && temp_buffer) return temp_buffer;
+    free(temp_buffer);
+#if CONFIG_SPIRAM
+    temp_buffer = heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
+#else
+    temp_buffer = malloc(size);
+#endif
+    temp_buffer_size = temp_buffer ? size : 0;
+    return temp_buffer;
+}
+
 // Apply pixel operation: combine src into dst
 static inline uint16_t apply_op(uint16_t dst, uint16_t src, uint8_t op)
 {
@@ -38,16 +55,27 @@ static void display_flush_region(int16_t x, int16_t y, int16_t w, int16_t h)
     if (y + h > RPUSBDISP_HEIGHT) h = RPUSBDISP_HEIGHT - y;
     if (w <= 0 || h <= 0) return;
 
-    // esp_lcd_panel_draw_bitmap expects a contiguous pixel buffer for the region.
-    // Our framebuffer is row-major for the full display, so we can send row by row
-    // or allocate a temp buffer. For simplicity, send the whole region if it spans
-    // the full width, otherwise send row by row.
     if (w == RPUSBDISP_WIDTH) {
-        esp_lcd_panel_draw_bitmap(panel_handle, x, y, x + w, y + h, &framebuffer[y * RPUSBDISP_WIDTH + x]);
+        // Full-width: framebuffer rows are contiguous, single SPI transfer
+        esp_lcd_panel_draw_bitmap(panel_handle, x, y, x + w, y + h,
+                                  &framebuffer[y * RPUSBDISP_WIDTH + x]);
     } else {
-        // Send row by row for partial-width regions
-        for (int row = y; row < y + h; row++) {
-            esp_lcd_panel_draw_bitmap(panel_handle, x, row, x + w, row + 1, &framebuffer[row * RPUSBDISP_WIDTH + x]);
+        // Partial-width: pack rows into contiguous temp buffer, single SPI transfer
+        size_t needed = w * h * sizeof(uint16_t);
+        uint16_t *temp = get_temp_buffer(needed);
+        if (temp) {
+            for (int row = 0; row < h; row++) {
+                memcpy(&temp[row * w],
+                       &framebuffer[(y + row) * RPUSBDISP_WIDTH + x],
+                       w * sizeof(uint16_t));
+            }
+            esp_lcd_panel_draw_bitmap(panel_handle, x, y, x + w, y + h, temp);
+        } else {
+            // Fallback: row by row if alloc failed
+            for (int row = y; row < y + h; row++) {
+                esp_lcd_panel_draw_bitmap(panel_handle, x, row, x + w, row + 1,
+                                          &framebuffer[row * RPUSBDISP_WIDTH + x]);
+            }
         }
     }
 }
@@ -84,7 +112,7 @@ esp_err_t display_init(void)
         .lcd_cmd_bits = 8,
         .lcd_param_bits = 8,
         .spi_mode = 0,
-        .trans_queue_depth = 1,
+        .trans_queue_depth = 10,
     };
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(DISPLAY_SPI_HOST, &io_config, &io_handle));
 
@@ -114,7 +142,7 @@ esp_err_t display_init(void)
         ESP_LOGE(TAG, "Failed to allocate framebuffer");
         return ESP_ERR_NO_MEM;
     }
-    memset(framebuffer, 0, RPUSBDISP_WIDTH * RPUSBDISP_HEIGHT * sizeof(uint16_t));
+    memset(framebuffer, 0, fb_size);
 
     // Clear screen to black
     display_fill(0x0000);
@@ -127,12 +155,23 @@ void display_fill(uint16_t color)
 {
     if (!framebuffer) return;
 
-    // Fill framebuffer
-    for (int i = 0; i < RPUSBDISP_WIDTH * RPUSBDISP_HEIGHT; i++) {
-        framebuffer[i] = color;
+    int total = RPUSBDISP_WIDTH * RPUSBDISP_HEIGHT;
+    if (color == 0) {
+        memset(framebuffer, 0, total * sizeof(uint16_t));
+    } else if ((color >> 8) == (color & 0xFF)) {
+        // Both bytes identical (e.g. 0xFFFF, 0x0000, 0x8484) — memset works
+        memset(framebuffer, color & 0xFF, total * sizeof(uint16_t));
+    } else {
+        // Fill first row, memcpy to remaining rows
+        for (int i = 0; i < RPUSBDISP_WIDTH; i++) {
+            framebuffer[i] = color;
+        }
+        for (int row = 1; row < RPUSBDISP_HEIGHT; row++) {
+            memcpy(&framebuffer[row * RPUSBDISP_WIDTH], framebuffer,
+                   RPUSBDISP_WIDTH * sizeof(uint16_t));
+        }
     }
 
-    // Flush entire screen
     display_flush_region(0, 0, RPUSBDISP_WIDTH, RPUSBDISP_HEIGHT);
 }
 
@@ -141,110 +180,118 @@ void display_rect(int16_t left, int16_t top, int16_t right, int16_t bottom,
 {
     if (!framebuffer) return;
 
-	//ESP_LOGI(TAG, "%s", __FUNCTION__);
-
     // Clamp coordinates
-    if (left < 0)
-		left = 0;
-    if (top < 0)
-		top = 0;
-    if (right > RPUSBDISP_WIDTH) 
-		right = RPUSBDISP_WIDTH-1;
-    if (bottom > RPUSBDISP_HEIGHT) 
-		bottom = RPUSBDISP_HEIGHT-1;
-    if (left >= right || top >= bottom) 
-		return;
+    if (left < 0) left = 0;
+    if (top < 0) top = 0;
+    if (right > RPUSBDISP_WIDTH) right = RPUSBDISP_WIDTH;
+    if (bottom > RPUSBDISP_HEIGHT) bottom = RPUSBDISP_HEIGHT;
+    if (left >= right || top >= bottom) return;
 
-    for (int y = top; y < bottom; y++) {
-        for (int x = left; x < right; x++) {
-            int idx = y * RPUSBDISP_WIDTH + x;
-            framebuffer[idx] = apply_op(framebuffer[idx], color, operation);
+    int w = right - left;
+
+    if (operation == RPUSBDISP_OPERATION_COPY) {
+        // Fast path: fill first row, memcpy to remaining
+        uint16_t *first_row = &framebuffer[top * RPUSBDISP_WIDTH + left];
+        for (int i = 0; i < w; i++) {
+            first_row[i] = color;
+        }
+        for (int y = top + 1; y < bottom; y++) {
+            memcpy(&framebuffer[y * RPUSBDISP_WIDTH + left], first_row,
+                   w * sizeof(uint16_t));
+        }
+    } else {
+        for (int y = top; y < bottom; y++) {
+            uint16_t *row = &framebuffer[y * RPUSBDISP_WIDTH + left];
+            for (int x = 0; x < w; x++) {
+                row[x] = apply_op(row[x], color, operation);
+            }
         }
     }
 
-    display_flush_region(left, top, right - left, bottom - top);
+    display_flush_region(left, top, w, bottom - top);
 }
 
 void display_bitblt(int16_t x, int16_t y, int16_t w, int16_t h,
                     uint8_t operation, const uint16_t *pixel_data)
 {
-    if (!framebuffer || !pixel_data)
-		return;
+    if (!framebuffer || !pixel_data) return;
 
-    for (int row = 0; row < h; row++) {
-        int dy = y + row;
-        if (dy < 0 || dy > RPUSBDISP_HEIGHT)
-			continue;
+    // Clamp source/dest region to display bounds
+    int src_x0 = 0, src_y0 = 0;
+    int dst_x = x, dst_y = y;
+    int cw = w, ch = h;
 
-        for (int col = 0; col < w; col++) {
-            int dx = x + col;
-            if (dx < 0 || dx > RPUSBDISP_WIDTH)
-				continue;
-            int fb_idx = dy * RPUSBDISP_WIDTH + dx;
-            int src_idx = row * w + col;
-            framebuffer[fb_idx] = apply_op(framebuffer[fb_idx], pixel_data[src_idx], operation);
+    if (dst_x < 0) { src_x0 = -dst_x; cw += dst_x; dst_x = 0; }
+    if (dst_y < 0) { src_y0 = -dst_y; ch += dst_y; dst_y = 0; }
+    if (dst_x + cw > RPUSBDISP_WIDTH)  cw = RPUSBDISP_WIDTH - dst_x;
+    if (dst_y + ch > RPUSBDISP_HEIGHT) ch = RPUSBDISP_HEIGHT - dst_y;
+    if (cw <= 0 || ch <= 0) return;
+
+    if (operation == RPUSBDISP_OPERATION_COPY) {
+        // Fast path: memcpy per row
+        for (int row = 0; row < ch; row++) {
+            memcpy(&framebuffer[(dst_y + row) * RPUSBDISP_WIDTH + dst_x],
+                   &pixel_data[(src_y0 + row) * w + src_x0],
+                   cw * sizeof(uint16_t));
         }
-    }
-
-    display_flush_region(x, y, w, h);
-}
-
-void display_copyarea(int16_t sx, int16_t sy, int16_t dx, int16_t dy, int16_t w, int16_t h)
-{
-	ESP_LOGI(TAG, "%s(%d, %d, %d, %d, %d, %d)", __FUNCTION__, sx, sy, dx, dy, w, h);
-
-    if (!framebuffer)
-		return;
-
-    // Use a temporary buffer to handle overlapping regions
-
-	// TODO: This doesn't have enough memory to make a full screen copy
-    uint16_t *temp = malloc(w*h*sizeof(uint16_t));
-
-    if (!temp) {
-        return;
-    }
-
-    if (w >= RPUSBDISP_WIDTH)
-		w = RPUSBDISP_WIDTH;
-    if (h >= RPUSBDISP_HEIGHT)
-		h = RPUSBDISP_HEIGHT;
-
-    // Copy source region to temp buffer
-    for (int row = 0; row < h; row++) {
-        int src_y = sy + row;
-        if (src_y < 0 || src_y > RPUSBDISP_HEIGHT) 
-			continue;
-
-        for (int col = 0; col < w; col++) {
-            int src_x = sx + col;
-
-			//ESP_LOGI(TAG, "  <%d, %d, %d, %d, %d, %d>", src_x, src_y, row, col, w, h);
-
-            if (src_x < 0 || src_x > RPUSBDISP_WIDTH) {
-                temp[row * w + col] = 0;
-            } else {
-                temp[row * w + col] = framebuffer[src_y * RPUSBDISP_WIDTH + src_x];
+    } else {
+        for (int row = 0; row < ch; row++) {
+            uint16_t *fb_row = &framebuffer[(dst_y + row) * RPUSBDISP_WIDTH + dst_x];
+            const uint16_t *src_row = &pixel_data[(src_y0 + row) * w + src_x0];
+            for (int col = 0; col < cw; col++) {
+                fb_row[col] = apply_op(fb_row[col], src_row[col], operation);
             }
         }
     }
 
-    // Write temp buffer to destination in framebuffer
-    for (int row = 0; row < h; row++) {
-        int dst_y = dy + row;
-        if (dst_y < 0 || dst_y > RPUSBDISP_HEIGHT)
-			continue;
-        for (int col = 0; col < w; col++) {
-            int dst_x = dx + col;
-            if (dst_x < 0 || dst_x > RPUSBDISP_WIDTH)
-				continue;
-            framebuffer[dst_y * RPUSBDISP_WIDTH + dst_x] = temp[row * w + col];
+    display_flush_region(dst_x, dst_y, cw, ch);
+}
+
+void display_copyarea(int16_t sx, int16_t sy, int16_t dx, int16_t dy,
+                      int16_t w, int16_t h)
+{
+    if (!framebuffer) return;
+
+    // Clamp source to display bounds
+    if (sx < 0) { w += sx; dx -= sx; sx = 0; }
+    if (sy < 0) { h += sy; dy -= sy; sy = 0; }
+    if (sx + w > RPUSBDISP_WIDTH)  w = RPUSBDISP_WIDTH - sx;
+    if (sy + h > RPUSBDISP_HEIGHT) h = RPUSBDISP_HEIGHT - sy;
+
+    // Clamp dest to display bounds
+    if (dx < 0) { w += dx; sx -= dx; dx = 0; }
+    if (dy < 0) { h += dy; sy -= dy; dy = 0; }
+    if (dx + w > RPUSBDISP_WIDTH)  w = RPUSBDISP_WIDTH - dx;
+    if (dy + h > RPUSBDISP_HEIGHT) h = RPUSBDISP_HEIGHT - dy;
+    if (w <= 0 || h <= 0) return;
+
+    // Check if regions overlap
+    bool overlaps = !(sx + w <= dx || dx + w <= sx || sy + h <= dy || dy + h <= sy);
+
+    if (!overlaps) {
+        // No overlap: copy directly row by row
+        for (int row = 0; row < h; row++) {
+            memcpy(&framebuffer[(dy + row) * RPUSBDISP_WIDTH + dx],
+                   &framebuffer[(sy + row) * RPUSBDISP_WIDTH + sx],
+                   w * sizeof(uint16_t));
+        }
+    } else if (dy < sy || (dy == sy && dx <= sx)) {
+        // Overlapping, copy forward (top to bottom)
+        for (int row = 0; row < h; row++) {
+            memmove(&framebuffer[(dy + row) * RPUSBDISP_WIDTH + dx],
+                    &framebuffer[(sy + row) * RPUSBDISP_WIDTH + sx],
+                    w * sizeof(uint16_t));
+        }
+    } else {
+        // Overlapping, copy backward (bottom to top)
+        for (int row = h - 1; row >= 0; row--) {
+            memmove(&framebuffer[(dy + row) * RPUSBDISP_WIDTH + dx],
+                    &framebuffer[(sy + row) * RPUSBDISP_WIDTH + sx],
+                    w * sizeof(uint16_t));
         }
     }
 
     display_flush_region(dx, dy, w, h);
-
-    free(temp);
 }
 
 uint16_t *display_get_framebuffer(void)
